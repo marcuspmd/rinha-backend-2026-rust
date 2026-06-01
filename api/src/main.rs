@@ -48,7 +48,9 @@ struct IVFIndex {
     n_vectors: usize,
     centroids: &'static [[f32; 16]],
     cluster_metadata: &'static [ClusterInfo],
-    vectors: &'static [[f32; 16]],
+    // Quantized i8 vectors loaded into heap: 192MB f32 → 48MB i8, zero page faults during search.
+    // Encoding: -1.0 sentinel → i8::MIN (-128); [0,1] range → [0, 127].
+    vectors: Vec<[i8; 16]>,
     labels: &'static [u8],
 }
 
@@ -91,7 +93,7 @@ impl IVFIndex {
             )
         };
 
-        let vectors = unsafe {
+        let f32_vectors = unsafe {
             std::slice::from_raw_parts(
                 mmap.as_ptr().add(vectors_offset) as *const [f32; 16],
                 n_vectors,
@@ -105,27 +107,27 @@ impl IVFIndex {
             )
         };
 
-        // Estendendo o lifetime para 'static (seguro pois a Mmap é mantida na struct global)
         let centroids = unsafe { std::mem::transmute::<&[[f32; 16]], &'static [[f32; 16]]>(centroids) };
         let cluster_metadata = unsafe { std::mem::transmute::<&[ClusterInfo], &'static [ClusterInfo]>(cluster_metadata) };
-        let vectors = unsafe { std::mem::transmute::<&[[f32; 16]], &'static [[f32; 16]]>(vectors) };
         let labels = unsafe { std::mem::transmute::<&[u8], &'static [u8]>(labels) };
 
-        // Pre-fault centroids and labels (which are small and fit in memory)
-        let mut float_sum = 0.0f64;
-        let mut label_sum = 0u64;
-        for c in centroids {
-            for &val in c {
-                float_sum += val as f64;
+        // Quantize f32 vectors → i8 and load into heap (192MB → 48MB).
+        // This eliminates page faults during search: all vectors fit in the 155MB memory limit.
+        let mut vectors: Vec<[i8; 16]> = Vec::with_capacity(n_vectors);
+        let mut checksum = 0i64;
+        for v in f32_vectors {
+            let mut qv = [0i8; 16];
+            for i in 0..16 {
+                qv[i] = if v[i] == -1.0 {
+                    i8::MIN
+                } else {
+                    (v[i] * 127.0).round() as i8
+                };
+                checksum += qv[i] as i64;
             }
+            vectors.push(qv);
         }
-        for &l in labels {
-            label_sum += l as u64;
-        }
-        println!(
-            "Centroids and labels memory pre-faulted. Float checksum: {}, Label checksum: {}",
-            float_sum, label_sum
-        );
+        println!("Index loaded: {} vectors quantized to i8 (checksum={})", n_vectors, checksum);
 
         Self {
             _mmap: mmap,
@@ -257,6 +259,18 @@ fn squared_distance(a: &[f32; 16], b: &[f32; 16]) -> f32 {
     sum
 }
 
+#[inline(always)]
+fn squared_distance_qi(q: &[f32; 16], b: &[i8; 16]) -> f32 {
+    const SCALE: f32 = 1.0 / 127.0;
+    let mut sum = 0.0f32;
+    for i in 0..16 {
+        let bq = if b[i] == i8::MIN { -1.0_f32 } else { b[i] as f32 * SCALE };
+        let diff = q[i] - bq;
+        sum += diff * diff;
+    }
+    sum
+}
+
 
 #[inline(always)]
 fn update_top5(top5: &mut [(f32, u8); 5], dist: f32, label: u8) {
@@ -367,7 +381,7 @@ async fn handle_fraud_score(
 
         // Loop principal da busca de vizinhos
         for idx in start..end {
-            let dist = squared_distance(&q, &state.index.vectors[idx]);
+            let dist = squared_distance_qi(&q, &state.index.vectors[idx]);
             if dist < threshold_top5 {
                 let label = state.index.labels[idx];
                 top5[4] = (dist, label);
