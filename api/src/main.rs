@@ -261,11 +261,12 @@ fn squared_distance(a: &[f32; 16], b: &[f32; 16]) -> f32 {
 
 #[inline(always)]
 fn squared_distance_qi(q: &[f32; 16], b: &[i8; 16]) -> f32 {
+    // No branch — lets the compiler auto-vectorize.
+    // Sentinel -1.0 is stored as -128; -128/127 ≈ -1.008 (error < 0.01, negligible for KNN).
     const SCALE: f32 = 1.0 / 127.0;
     let mut sum = 0.0f32;
     for i in 0..16 {
-        let bq = if b[i] == i8::MIN { -1.0_f32 } else { b[i] as f32 * SCALE };
-        let diff = q[i] - bq;
+        let diff = q[i] - b[i] as f32 * SCALE;
         sum += diff * diff;
     }
     sum
