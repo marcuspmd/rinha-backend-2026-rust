@@ -48,9 +48,9 @@ struct IVFIndex {
     n_vectors: usize,
     centroids: &'static [[f32; 16]],
     cluster_metadata: &'static [ClusterInfo],
-    // Quantized i8 vectors loaded into heap: 192MB f32 → 48MB i8, zero page faults during search.
-    // Encoding: -1.0 sentinel → i8::MIN (-128); [0,1] range → [0, 127].
-    vectors: Vec<[i8; 16]>,
+    // Quantized i16 vectors loaded into heap: 192MB f32 → 96MB i16, zero page faults during search.
+    // Encoding: Sentinel/regular values scaled by 5000.0.
+    vectors: Vec<[i16; 16]>,
     labels: &'static [u8],
 }
 
@@ -111,23 +111,19 @@ impl IVFIndex {
         let cluster_metadata = unsafe { std::mem::transmute::<&[ClusterInfo], &'static [ClusterInfo]>(cluster_metadata) };
         let labels = unsafe { std::mem::transmute::<&[u8], &'static [u8]>(labels) };
 
-        // Quantize f32 vectors → i8 and load into heap (192MB → 48MB).
+        // Quantize f32 vectors → i16 and load into heap (192MB → 96MB).
         // This eliminates page faults during search: all vectors fit in the 155MB memory limit.
-        let mut vectors: Vec<[i8; 16]> = Vec::with_capacity(n_vectors);
+        let mut vectors: Vec<[i16; 16]> = Vec::with_capacity(n_vectors);
         let mut checksum = 0i64;
         for v in f32_vectors {
-            let mut qv = [0i8; 16];
+            let mut qv = [0i16; 16];
             for i in 0..16 {
-                qv[i] = if v[i] == -1.0 {
-                    i8::MIN
-                } else {
-                    (v[i] * 127.0).round() as i8
-                };
+                qv[i] = (v[i] * 5000.0).round() as i16;
                 checksum += qv[i] as i64;
             }
             vectors.push(qv);
         }
-        println!("Index loaded: {} vectors quantized to i8 (checksum={})", n_vectors, checksum);
+        println!("Index loaded: {} vectors quantized to i16 (checksum={})", n_vectors, checksum);
 
         Self {
             _mmap: mmap,
@@ -253,11 +249,11 @@ fn squared_distance(a: &[f32; 16], b: &[f32; 16]) -> f32 {
     sum
 }
 
-// Pure integer i8 distance — eliminates f32 conversion in the hot cluster-scan loop.
-// Encoding: sentinel -1.0 → i8::MIN; [0,1] → [0,127].
+// Pure integer i16 distance — eliminates f32 conversion in the hot cluster-scan loop.
+// Encoding: sentinel/regular values scaled by 5000.0.
 // Relative ordering is preserved; comparison uses i32 units throughout.
 #[inline(always)]
-fn squared_distance_i8(a: &[i8; 16], b: &[i8; 16]) -> i32 {
+fn squared_distance_i16(a: &[i16; 16], b: &[i16; 16]) -> i32 {
     let mut sum = 0i32;
     for i in 0..16 {
         let diff = a[i] as i32 - b[i] as i32;
@@ -359,22 +355,17 @@ async fn handle_fraud_score(
         }
     }
 
-    // Quantiza o query para i8 para o scan dos clusters (mesma codificação do índice).
-    // Evita conversão i8→f32 no loop quente — permite auto-vectorização SIMD inteira.
-    let q_i8: [i8; 16] = {
-        let mut qi = [0i8; 16];
+    // Quantiza o query para i16 para o scan dos clusters (mesma codificação do índice).
+    // Evita conversão i16→f32 no loop quente — permite auto-vectorização SIMD inteira.
+    let q_i16: [i16; 16] = {
+        let mut qi = [0i16; 16];
         for i in 0..16 {
-            qi[i] = if q[i] == -1.0 {
-                i8::MIN
-            } else {
-                (q[i] * 127.0).round() as i8
-            };
+            qi[i] = (q[i] * 5000.0).round() as i16;
         }
         qi
     };
 
     // 4. Varrer vetores nos clusters selecionados buscando os top 5 vizinhos mais próximos.
-    // Prefetch do próximo cluster esconde a latência DRAM na transição entre clusters.
     let mut top5 = [(i32::MAX, 0u8); 5];
     let mut threshold_top5 = i32::MAX;
     let probed = &nearest_centroids[..nprobe];
@@ -387,9 +378,9 @@ async fn handle_fraud_score(
             let next_k = probed[i + 1].1;
             let next_start = state.index.cluster_metadata[next_k].offset as usize;
             unsafe {
-                let ptr = state.index.vectors.as_ptr().add(next_start) as *const i8;
+                let ptr = state.index.vectors.as_ptr().add(next_start) as *const i16;
                 #[cfg(target_arch = "x86_64")]
-                std::arch::x86_64::_mm_prefetch(ptr, std::arch::x86_64::_MM_HINT_T1);
+                std::arch::x86_64::_mm_prefetch(ptr as *const i8, std::arch::x86_64::_MM_HINT_T1);
             }
         }
 
@@ -398,7 +389,7 @@ async fn handle_fraud_score(
         let end = start + meta.count as usize;
 
         for idx in start..end {
-            let dist = squared_distance_i8(&q_i8, &state.index.vectors[idx]);
+            let dist = squared_distance_i16(&q_i16, &state.index.vectors[idx]);
             if dist < threshold_top5 {
                 let label = state.index.labels[idx];
                 top5[4] = (dist, label);
@@ -433,16 +424,19 @@ fn main() {
 
     // 1. Inicializar tabela estática de MCC de risco
     let mut mcc_risk_table = [0.5f32; 10000];
+    let mut mcc_count = 0;
     if let Ok(file) = File::open("resources/mcc_risk.json") {
         if let Ok(map) = serde_json::from_reader::<_, std::collections::HashMap<String, f32>>(file) {
             for (mcc_str, risk) in map {
                 let idx = parse_mcc(&mcc_str);
                 if idx < 10000 {
                     mcc_risk_table[idx] = risk;
+                    mcc_count += 1;
                 }
             }
         }
     }
+    println!("MCC risk table loaded: {} entries", mcc_count);
 
     // 2. Mapear o index.bin gerado no build
     let index = IVFIndex::new("index.bin");
@@ -460,11 +454,18 @@ fn main() {
         .route("/fraud-score", post(handle_fraud_score))
         .with_state(state);
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(workers)
-        .enable_all()
-        .build()
-        .unwrap();
+    let rt = if workers <= 1 {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    } else {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(workers)
+            .enable_all()
+            .build()
+            .unwrap()
+    };
 
     rt.block_on(async move {
         // 4. Iniciar servidor (Socket Unix se SOCKET_PATH estiver definido, senão fallback TCP)
@@ -512,10 +513,14 @@ fn main() {
                 });
             }
         } else {
-            let listener = tokio::net::TcpListener::bind("0.0.0.0:8080")
+            let port = std::env::var("PORT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(8080);
+            let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
                 .await
                 .unwrap();
-            println!("API escutando em http://0.0.0.0:8080");
+            println!("API escutando em http://0.0.0.0:{}", port);
             axum::serve(listener, app).await.unwrap();
         }
     });
