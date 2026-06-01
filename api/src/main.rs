@@ -373,11 +373,26 @@ async fn handle_fraud_score(
         qi
     };
 
-    // 4. Varrer vetores nos clusters selecionados buscando os top 5 vizinhos mais próximos
+    // 4. Varrer vetores nos clusters selecionados buscando os top 5 vizinhos mais próximos.
+    // Prefetch do próximo cluster esconde a latência DRAM na transição entre clusters.
     let mut top5 = [(i32::MAX, 0u8); 5];
     let mut threshold_top5 = i32::MAX;
+    let probed = &nearest_centroids[..nprobe];
 
-    for &(_, k) in &nearest_centroids[..nprobe] {
+    for i in 0..nprobe {
+        let k = probed[i].1;
+
+        // Prefetch o início do próximo cluster enquanto processamos o atual.
+        if i + 1 < nprobe {
+            let next_k = probed[i + 1].1;
+            let next_start = state.index.cluster_metadata[next_k].offset as usize;
+            unsafe {
+                let ptr = state.index.vectors.as_ptr().add(next_start) as *const i8;
+                #[cfg(target_arch = "x86_64")]
+                std::arch::x86_64::_mm_prefetch(ptr, std::arch::x86_64::_MM_HINT_T1);
+            }
+        }
+
         let meta = &state.index.cluster_metadata[k];
         let start = meta.offset as usize;
         let end = start + meta.count as usize;
