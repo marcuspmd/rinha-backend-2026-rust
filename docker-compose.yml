@@ -1,0 +1,62 @@
+version: '3.8'
+
+services:
+  haproxy:
+    image: haproxy:2.8-alpine
+    container_name: haproxy
+    volumes:
+      - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - sock-dir:/run/sock
+    ports:
+      - "9999:9999"
+    depends_on:
+      - api1
+      - api2
+    deploy:
+      resources:
+        limits:
+          cpus: "0.2"
+          memory: "40MB"
+    networks:
+      - rinha-net
+
+  api1:
+    image: docker.io/marcuspmd/rinha-backend-2026-rust:latest
+    container_name: api1
+    volumes:
+      - sock-dir:/run/sock
+    environment:
+      - SOCKET_PATH=/run/sock/api1.sock
+      - WORKERS=2
+      - NPROBE=256
+    deploy:
+      resources:
+        limits:
+          cpus: "0.40"
+          memory: "155MB"
+    networks:
+      - rinha-net
+
+  api2:
+    image: docker.io/marcuspmd/rinha-backend-2026-rust:latest
+    container_name: api2
+    volumes:
+      - sock-dir:/run/sock
+    environment:
+      - SOCKET_PATH=/run/sock/api2.sock
+      - WORKERS=2
+      - NPROBE=256
+    deploy:
+      resources:
+        limits:
+          cpus: "0.40"
+          memory: "155MB"
+    networks:
+      - rinha-net
+
+volumes:
+  sock-dir:
+
+networks:
+  rinha-net:
+    driver: bridge
