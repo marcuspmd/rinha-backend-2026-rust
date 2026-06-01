@@ -240,13 +240,7 @@ fn parse_mcc(mcc_str: &str) -> usize {
 }
 
 fn clamp01(x: f32) -> f32 {
-    if x < 0.0 {
-        0.0
-    } else if x > 1.0 {
-        1.0
-    } else {
-        x
-    }
+    x.clamp(0.0, 1.0)
 }
 
 #[inline(always)]
@@ -259,30 +253,17 @@ fn squared_distance(a: &[f32; 16], b: &[f32; 16]) -> f32 {
     sum
 }
 
+// Pure integer i8 distance — eliminates f32 conversion in the hot cluster-scan loop.
+// Encoding: sentinel -1.0 → i8::MIN; [0,1] → [0,127].
+// Relative ordering is preserved; comparison uses i32 units throughout.
 #[inline(always)]
-fn squared_distance_qi(q: &[f32; 16], b: &[i8; 16]) -> f32 {
-    // No branch — lets the compiler auto-vectorize.
-    // Sentinel -1.0 is stored as -128; -128/127 ≈ -1.008 (error < 0.01, negligible for KNN).
-    const SCALE: f32 = 1.0 / 127.0;
-    let mut sum = 0.0f32;
+fn squared_distance_i8(a: &[i8; 16], b: &[i8; 16]) -> i32 {
+    let mut sum = 0i32;
     for i in 0..16 {
-        let diff = q[i] - b[i] as f32 * SCALE;
+        let diff = a[i] as i32 - b[i] as i32;
         sum += diff * diff;
     }
     sum
-}
-
-
-#[inline(always)]
-fn update_top5(top5: &mut [(f32, u8); 5], dist: f32, label: u8) {
-    if dist < top5[4].0 {
-        top5[4] = (dist, label);
-        let mut i = 4;
-        while i > 0 && top5[i].0 < top5[i - 1].0 {
-            top5.swap(i, i - 1);
-            i -= 1;
-        }
-    }
 }
 
 async fn handle_ready() -> StatusCode {
@@ -354,35 +335,55 @@ async fn handle_fraud_score(
     q[14] = 0.0;
     q[15] = 0.0;
 
-    // 3. Encontrar os nprobe centroides mais próximos (insertion sort com threshold)
+    // 3. Encontrar os nprobe centroides mais próximos — batch de 4 por iteração para melhor ILP.
+    // K_CENTROIDS=8192 é divisível por 4; sem resto.
     let nprobe = state.nprobe;
     let mut nearest_centroids = [(f32::MAX, 0usize); MAX_NPROBE];
     let mut threshold = f32::MAX;
-    for k in 0..K_CENTROIDS {
-        let dist = squared_distance(&q, &state.index.centroids[k]);
-        if dist < threshold {
-            nearest_centroids[nprobe - 1] = (dist, k);
-            let mut i = nprobe - 1;
-            while i > 0 && nearest_centroids[i].0 < nearest_centroids[i - 1].0 {
-                nearest_centroids.swap(i, i - 1);
-                i -= 1;
+    for chunk in 0..(K_CENTROIDS / 4) {
+        let k = chunk * 4;
+        let d0 = squared_distance(&q, &state.index.centroids[k]);
+        let d1 = squared_distance(&q, &state.index.centroids[k + 1]);
+        let d2 = squared_distance(&q, &state.index.centroids[k + 2]);
+        let d3 = squared_distance(&q, &state.index.centroids[k + 3]);
+        for (dist, ki) in [(d0, k), (d1, k + 1), (d2, k + 2), (d3, k + 3)] {
+            if dist < threshold {
+                nearest_centroids[nprobe - 1] = (dist, ki);
+                let mut i = nprobe - 1;
+                while i > 0 && nearest_centroids[i].0 < nearest_centroids[i - 1].0 {
+                    nearest_centroids.swap(i, i - 1);
+                    i -= 1;
+                }
+                threshold = nearest_centroids[nprobe - 1].0;
             }
-            threshold = nearest_centroids[nprobe - 1].0;
         }
     }
 
+    // Quantiza o query para i8 para o scan dos clusters (mesma codificação do índice).
+    // Evita conversão i8→f32 no loop quente — permite auto-vectorização SIMD inteira.
+    let q_i8: [i8; 16] = {
+        let mut qi = [0i8; 16];
+        for i in 0..16 {
+            qi[i] = if q[i] == -1.0 {
+                i8::MIN
+            } else {
+                (q[i] * 127.0).round() as i8
+            };
+        }
+        qi
+    };
+
     // 4. Varrer vetores nos clusters selecionados buscando os top 5 vizinhos mais próximos
-    let mut top5 = [(f32::MAX, 0u8); 5];
-    let mut threshold_top5 = f32::MAX;
+    let mut top5 = [(i32::MAX, 0u8); 5];
+    let mut threshold_top5 = i32::MAX;
 
     for &(_, k) in &nearest_centroids[..nprobe] {
         let meta = &state.index.cluster_metadata[k];
         let start = meta.offset as usize;
         let end = start + meta.count as usize;
 
-        // Loop principal da busca de vizinhos
         for idx in start..end {
-            let dist = squared_distance_qi(&q, &state.index.vectors[idx]);
+            let dist = squared_distance_i8(&q_i8, &state.index.vectors[idx]);
             if dist < threshold_top5 {
                 let label = state.index.labels[idx];
                 top5[4] = (dist, label);
