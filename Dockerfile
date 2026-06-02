@@ -20,19 +20,17 @@ RUN ARCH=$(uname -m) && \
 WORKDIR /usr/src/app
 
 # Copiar todo o workspace do Rust e os recursos
-COPY Cargo.toml Cargo.lock ./
-COPY api/ api/
-COPY pre-processor/ pre-processor/
+COPY my-solution/ my-solution/
 COPY resources/ resources/
 
 # Compilar em modo release de acordo com a arquitetura detectada
 RUN ARCH=$(uname -m) && \
     if [ "$ARCH" = "x86_64" ]; then \
-        RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release --target x86_64-unknown-linux-musl --bin api && \
-        cp target/x86_64-unknown-linux-musl/release/api /usr/src/app/api_binary; \
+        RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --manifest-path my-solution/Cargo.toml --release --target x86_64-unknown-linux-musl --bin api && \
+        cp my-solution/target/x86_64-unknown-linux-musl/release/api /usr/src/app/api_binary; \
     elif [ "$ARCH" = "aarch64" ]; then \
-        RUSTFLAGS="-C target-cpu=native" cargo build --release --target aarch64-unknown-linux-musl --bin api && \
-        cp target/aarch64-unknown-linux-musl/release/api /usr/src/app/api_binary; \
+        RUSTFLAGS="-C target-cpu=native" cargo build --manifest-path my-solution/Cargo.toml --release --target aarch64-unknown-linux-musl --bin api && \
+        cp my-solution/target/aarch64-unknown-linux-musl/release/api /usr/src/app/api_binary; \
     fi
 
 # Stage 2: Runtime (imagem scratch ultra-minimalista, sem OS/page cache)
@@ -44,7 +42,7 @@ WORKDIR /app
 COPY --from=builder /usr/src/app/api_binary /app/api
 
 # Copiar index binário pré-processado
-COPY index.bin /app/index.bin
+COPY my-solution/index.bin /app/index.bin
 
 # Copiar mcc_risk
 COPY --from=builder /usr/src/app/resources/mcc_risk.json /app/resources/mcc_risk.json

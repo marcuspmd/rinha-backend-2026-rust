@@ -2,15 +2,9 @@
 
 use std::fs::File;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 use std::time::Instant;
-use axum::{
-    extract::State,
-    http::{header, StatusCode},
-    response::IntoResponse,
-    routing::{get, post},
-    Router,
-};
+use std::io::{Read, Write};
 use serde::Deserialize;
 
 #[cfg(not(target_os = "macos"))]
@@ -34,9 +28,10 @@ static METRIC_CLUSTER_SCAN_NS: AtomicU64 = AtomicU64::new(0);
 static METRIC_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
 static METRIC_COUNT: AtomicU64 = AtomicU64::new(0);
 
+static IS_READY: AtomicBool = AtomicBool::new(false);
+
 // Parâmetros de Busca IVF-Flat
 const K_CENTROIDS: usize = 8192;
-// Runtime nprobe is read from NPROBE env var; this is the stack-allocated max.
 const MAX_NPROBE: usize = 8192;
 
 // Constantes de Normalização
@@ -53,6 +48,7 @@ const MAX_MERCHANT_AVG_AMOUNT: f64 = 10000.0;
 struct ClusterInfo {
     offset: u32,
     count: u32,
+    radius: f32,
 }
 
 struct IVFIndex {
@@ -61,11 +57,9 @@ struct IVFIndex {
     n_vectors: usize,
     centroids: &'static [[f32; 16]],
     cluster_metadata: &'static [ClusterInfo],
-    // Quantized i16 vectors loaded into heap: 192MB f32 → 96MB i16, zero page faults during search.
-    // Encoding: Sentinel/regular values scaled by 5000.0.
-    vectors: Vec<[i16; 16]>,
+    vectors: &'static [[f32; 16]],
     labels: &'static [u8],
-    f32_vectors: &'static [[f32; 16]],
+    distances: &'static [f32],
 }
 
 impl IVFIndex {
@@ -91,7 +85,10 @@ impl IVFIndex {
         let labels_offset = vectors_offset + vectors_len;
         let labels_len = n_vectors;
 
-        assert_eq!(mmap.len(), labels_offset + labels_len);
+        let distances_offset = labels_offset + labels_len;
+        let distances_len = n_vectors * std::mem::size_of::<f32>();
+
+        assert_eq!(mmap.len(), distances_offset + distances_len);
 
         let centroids = unsafe {
             std::slice::from_raw_parts(
@@ -121,25 +118,27 @@ impl IVFIndex {
             )
         };
 
+        let distances = unsafe {
+            std::slice::from_raw_parts(
+                mmap.as_ptr().add(distances_offset) as *const f32,
+                n_vectors,
+            )
+        };
+
         let centroids = unsafe { std::mem::transmute::<&[[f32; 16]], &'static [[f32; 16]]>(centroids) };
         let cluster_metadata = unsafe { std::mem::transmute::<&[ClusterInfo], &'static [ClusterInfo]>(cluster_metadata) };
-        let labels = unsafe { std::mem::transmute::<&[u8], &'static [u8]>(labels) };
-
-        // Quantize f32 vectors → i16 and load into heap (192MB → 96MB).
-        // This eliminates page faults during search: all vectors fit in the 155MB memory limit.
-        let mut vectors: Vec<[i16; 16]> = Vec::with_capacity(n_vectors);
-        let mut checksum = 0i64;
-        for v in f32_vectors {
-            let mut qv = [0i16; 16];
-            for i in 0..16 {
-                qv[i] = (v[i] * 5000.0).round() as i16;
-                checksum += qv[i] as i64;
-            }
-            vectors.push(qv);
-        }
-        println!("Index loaded: {} vectors quantized to i16 (checksum={})", n_vectors, checksum);
-
         let f32_vectors = unsafe { std::mem::transmute::<&[[f32; 16]], &'static [[f32; 16]]>(f32_vectors) };
+        let labels = unsafe { std::mem::transmute::<&[u8], &'static [u8]>(labels) };
+        let distances = unsafe { std::mem::transmute::<&[f32], &'static [f32]>(distances) };
+
+        // Pretouch mmap to prevent page faults during benchmark
+        let page_size = 4096;
+        let mut dummy = 0u8;
+        for offset in (0..mmap.len()).step_by(page_size) {
+            dummy ^= mmap[offset];
+        }
+        println!("Mmap pretouch complete, dummy value = {}", dummy);
+        println!("Index loaded: {} vectors mapped as f32 directly", n_vectors);
 
         Self {
             _mmap: mmap,
@@ -147,14 +146,13 @@ impl IVFIndex {
             n_vectors,
             centroids,
             cluster_metadata,
-            vectors,
+            vectors: f32_vectors,
             labels,
-            f32_vectors,
+            distances,
         }
     }
 }
 
-// Structs para receber o payload de transação com zero-copy borrowing
 #[derive(Deserialize)]
 struct RequestPayload<'a> {
     id: &'a str,
@@ -206,7 +204,6 @@ struct AppState {
     nprobe: usize,
 }
 
-/// Days since 1970-01-01 for a civil date (Howard Hinnant's algorithm).
 #[inline]
 fn days_from_civil(y: i64, m: i64, day: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
@@ -217,8 +214,6 @@ fn days_from_civil(y: i64, m: i64, day: i64) -> i64 {
     era * 146097 + doe - 719468
 }
 
-/// Parse ISO-8601 date to (epoch_seconds, hour, day_of_week_mon0).
-/// Matches the reference solution's datetime::parse exactly.
 #[inline]
 fn parse_datetime(date_str: &str) -> (i64, u8, u8) {
     let b = date_str.as_bytes();
@@ -236,9 +231,8 @@ fn parse_datetime(date_str: &str) -> (i64, u8, u8) {
     let sec = ((b[17] - b'0') as i64) * 10 + (b[18] - b'0') as i64;
     let days = days_from_civil(year, month, day);
     let epoch = days * 86400 + hour * 3600 + min * 60 + sec;
-    // 1970-01-01 was a Thursday (=4 in a Sunday-0 scheme).
-    let dow_sun0 = ((days % 7 + 4) % 7 + 7) % 7; // 0=Sun..6=Sat, negative-safe
-    let dow_mon0 = ((dow_sun0 + 6) % 7) as u8;   // mon=0..sun=6
+    let dow_sun0 = ((days % 7 + 4) % 7 + 7) % 7;
+    let dow_mon0 = ((dow_sun0 + 6) % 7) as u8;
     (epoch, hour as u8, dow_mon0)
 }
 
@@ -375,294 +369,570 @@ fn squared_distance_i16_fallback(a: &[i16; 16], b: &[i16; 16]) -> i32 {
     sum
 }
 
-async fn handle_ready() -> StatusCode {
-    StatusCode::OK
+struct ParsedRequest {
+    method: String,
+    path: String,
+    body_offset: usize,
+    body_len: usize,
+    keep_alive: bool,
 }
 
-async fn handle_telemetry() -> impl IntoResponse {
-    let count = METRIC_COUNT.load(Ordering::Relaxed);
-    if count == 0 {
-        return axum::Json(serde_json::json!({
-            "count": 0,
-            "json_parse_us": 0.0,
-            "vectorize_us": 0.0,
-            "centroid_search_us": 0.0,
-            "cluster_scan_us": 0.0,
-            "total_us": 0.0,
-        }));
-    }
-
-    let count_f = count as f64;
-    let json_parse_us = (METRIC_JSON_PARSE_NS.load(Ordering::Relaxed) as f64 / count_f) / 1000.0;
-    let vectorize_us = (METRIC_VECTORIZE_NS.load(Ordering::Relaxed) as f64 / count_f) / 1000.0;
-    let centroid_search_us = (METRIC_CENTROID_SEARCH_NS.load(Ordering::Relaxed) as f64 / count_f) / 1000.0;
-    let cluster_scan_us = (METRIC_CLUSTER_SCAN_NS.load(Ordering::Relaxed) as f64 / count_f) / 1000.0;
-    let total_us = (METRIC_TOTAL_NS.load(Ordering::Relaxed) as f64 / count_f) / 1000.0;
-
-    axum::Json(serde_json::json!({
-        "count": count,
-        "json_parse_us": json_parse_us,
-        "vectorize_us": vectorize_us,
-        "centroid_search_us": centroid_search_us,
-        "cluster_scan_us": cluster_scan_us,
-        "total_us": total_us,
-    }))
-}
-
-async fn handle_fraud_score(
-    State(state): State<Arc<AppState>>,
-    body: axum::body::Bytes,
-) -> impl IntoResponse {
-    let start_time = Instant::now();
-
-    // 1. Parser JSON
-    let json_start = Instant::now();
-    let payload: RequestPayload = match serde_json::from_slice(&body) {
-        Ok(p) => p,
-        // Malformed input: return legit (FP weight 1) instead of 500 (Err weight 5)
-        Err(_) => return ([(header::CONTENT_TYPE, "application/json")], RESPONSES[0]),
-    };
-    let json_dur = json_start.elapsed().as_nanos() as u64;
-    METRIC_JSON_PARSE_NS.fetch_add(json_dur, Ordering::Relaxed);
-
-    let vec_start = Instant::now();
-    // 1. Parser rápido de data (Hinnant's algorithm, matching reference solution)
-    let (req_epoch, hour, dow) = parse_datetime(payload.transaction.requested_at);
-
-    // 2. Normalização do vetor da transação recebida (f64 intermediate, matching reference)
-    let mut q = [0.0f32; 16];
-    q[0] = clamp01((payload.transaction.amount / MAX_AMOUNT) as f32);
-    q[1] = clamp01((payload.transaction.installments / MAX_INSTALLMENTS) as f32);
-
-    let avg = payload.customer.avg_amount;
-    q[2] = if avg > 0.0 {
-        clamp01(((payload.transaction.amount / avg) / AMOUNT_VS_AVG_RATIO) as f32)
+fn parse_http(buf: &[u8]) -> Option<ParsedRequest> {
+    let headers_end = buf.windows(4).position(|w| w == b"\r\n\r\n");
+    let (header_len, body_start) = if let Some(pos) = headers_end {
+        (pos, pos + 4)
     } else {
-        1.0
-    };
-    q[3] = hour as f32 / 23.0;
-    q[4] = dow as f32 / 6.0;
-
-    match &payload.last_transaction {
-        Some(lt) => {
-            let last_epoch = parse_datetime(lt.timestamp).0;
-            let minutes = (req_epoch - last_epoch) as f64 / 60.0;
-            q[5] = clamp01((minutes / MAX_MINUTES) as f32);
-            q[6] = clamp01((lt.km_from_current / MAX_KM) as f32);
+        if let Some(pos) = buf.windows(2).position(|w| w == b"\n\n") {
+            (pos, pos + 2)
+        } else {
+            return None;
         }
-        None => {
-            q[5] = -1.0;
-            q[6] = -1.0;
-        }
-    }
-
-    q[7] = clamp01((payload.terminal.km_from_home / MAX_KM) as f32);
-    q[8] = clamp01((payload.customer.tx_count_24h / MAX_TX_COUNT_24H) as f32);
-    q[9] = if payload.terminal.is_online { 1.0 } else { 0.0 };
-    q[10] = if payload.terminal.card_present { 1.0 } else { 0.0 };
-
-    // Busca linear rápida no coorte curto de conhecidos
-    let is_known = payload
-        .customer
-        .known_merchants
-        .iter()
-        .any(|m| *m == payload.merchant.id);
-    q[11] = if is_known { 0.0 } else { 1.0 };
-
-    // O(1) MCC Risk Lookup
-    let mcc_idx = parse_mcc(payload.merchant.mcc);
-    q[12] = if mcc_idx < 10000 {
-        state.mcc_risk_table[mcc_idx]
-    } else {
-        0.5
     };
 
-    q[13] = clamp01((payload.merchant.avg_amount / MAX_MERCHANT_AVG_AMOUNT) as f32);
-    q[14] = 0.0;
-    q[15] = 0.0;
-    let vec_dur = vec_start.elapsed().as_nanos() as u64;
-    METRIC_VECTORIZE_NS.fetch_add(vec_dur, Ordering::Relaxed);
-
-    // 3. Encontrar os nprobe centroides mais próximos.
-    // Computar todas as distâncias de forma contígua em um buffer na stack para permitir auto-vetorização.
-    let centroid_start = Instant::now();
-    let nprobe = state.nprobe;
-
-    let mut dists = [0.0f32; K_CENTROIDS];
+    let headers_part = &buf[..header_len];
+    let mut lines = headers_part.split(|&b| b == b'\n');
+    let first_line = lines.next()?;
     
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        use std::arch::x86_64::*;
-        let vq0 = _mm256_loadu_ps(q.as_ptr());
-        let vq1 = _mm256_loadu_ps(q.as_ptr().add(8));
-        for k in 0..K_CENTROIDS {
-            dists[k] = squared_distance_preloaded(vq0, vq1, &state.index.centroids[k]);
-        }
-    }
+    let mut parts = first_line.split(|&b| b == b' ');
+    let method_bytes = parts.next()?;
+    let path_bytes = parts.next()?;
+    
+    let method = std::str::from_utf8(method_bytes).ok()?.trim().to_string();
+    let path = std::str::from_utf8(path_bytes).ok()?.trim().to_string();
 
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        use std::arch::aarch64::*;
-        let vq0 = vld1q_f32(q.as_ptr());
-        let vq1 = vld1q_f32(q.as_ptr().add(4));
-        let vq2 = vld1q_f32(q.as_ptr().add(8));
-        let vq3 = vld1q_f32(q.as_ptr().add(12));
-        for k in 0..K_CENTROIDS {
-            dists[k] = squared_distance_preloaded(vq0, vq1, vq2, vq3, &state.index.centroids[k]);
-        }
-    }
+    let mut content_length = 0;
+    let mut keep_alive = true;
 
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    for k in 0..K_CENTROIDS {
-        dists[k] = squared_distance_fallback(&q, &state.index.centroids[k]);
-    }
+    for line in lines {
+        let line_trimmed = if line.ends_with(b"\r") {
+            &line[..line.len()-1]
+        } else {
+            line
+        };
+        if line_trimmed.is_empty() { continue; }
 
-    // Inicializar índices na stack
-    let mut indices = [0u16; K_CENTROIDS];
-    for i in 0..K_CENTROIDS {
-        indices[i] = i as u16;
-    }
+        if let Some(colon_pos) = line_trimmed.iter().position(|&b| b == b':') {
+            let key = &line_trimmed[..colon_pos];
+            let value = &line_trimmed[colon_pos+1..];
+            
+            let mut val_start = 0;
+            while val_start < value.len() && (value[val_start] == b' ' || value[val_start] == b'\t') {
+                val_start += 1;
+            }
+            let val_trimmed = &value[val_start..];
 
-    // Quickselect O(N) na stack para obter os nprobe centróides mais próximos (desordenados)
-    indices.select_nth_unstable_by(nprobe - 1, |&a, &b| {
-        dists[a as usize].partial_cmp(&dists[b as usize]).unwrap()
-    });
-
-    let centroid_dur = centroid_start.elapsed().as_nanos() as u64;
-    METRIC_CENTROID_SEARCH_NS.fetch_add(centroid_dur, Ordering::Relaxed);
-
-    let scan_start = Instant::now();
-    // Quantiza o query para i16 para o scan dos clusters (mesma codificação do índice).
-    // Evita conversão i16→f32 no loop quente — permite auto-vectorização SIMD inteira.
-    let q_i16: [i16; 16] = {
-        let mut qi = [0i16; 16];
-        for i in 0..16 {
-            qi[i] = (q[i] * 5000.0).round() as i16;
-        }
-        qi
-    };
-
-    // 4. Varrer vetores nos clusters selecionados buscando os top 16 vizinhos mais próximos.
-    let mut top_candidates = [(i32::MAX, 0usize); 16]; // (dist_i16, idx)
-    let mut threshold_candidates = i32::MAX;
-    let probed = &indices[0..nprobe];
-
-    for i in 0..nprobe {
-        let k = probed[i] as usize;
-
-        // Prefetch o início do próximo cluster enquanto processamos o atual.
-        #[cfg(target_arch = "x86_64")]
-        if i + 1 < nprobe {
-            let next_k = probed[i + 1] as usize;
-            let next_start = state.index.cluster_metadata[next_k].offset as usize;
-            unsafe {
-                let ptr = state.index.vectors.as_ptr().add(next_start) as *const i16;
-                std::arch::x86_64::_mm_prefetch(ptr as *const i8, std::arch::x86_64::_MM_HINT_T1);
+            if key.eq_ignore_ascii_case(b"content-length") {
+                if let Ok(len_str) = std::str::from_utf8(val_trimmed) {
+                    if let Ok(len) = len_str.parse::<usize>() {
+                        content_length = len;
+                    }
+                }
+            } else if key.eq_ignore_ascii_case(b"connection") {
+                if val_trimmed.eq_ignore_ascii_case(b"close") {
+                    keep_alive = false;
+                }
             }
         }
+    }
 
-        let meta = &state.index.cluster_metadata[k];
-        let start = meta.offset as usize;
-        let end = start + meta.count as usize;
+    if body_start + content_length > buf.len() {
+        return None;
+    }
 
+    Some(ParsedRequest {
+        method,
+        path,
+        body_offset: body_start,
+        body_len: content_length,
+        keep_alive,
+    })
+}
+
+fn handle_connection<S: Read + Write>(
+    mut stream: S,
+    state: &Arc<AppState>,
+    buf: &mut Vec<u8>
+) -> std::io::Result<()> {
+    buf.clear();
+    let mut temp_buf = [0u8; 8192];
+    
+    loop {
+        let n = match stream.read(&mut temp_buf) {
+            Ok(0) => return Ok(()),
+            Ok(size) => size,
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+        buf.extend_from_slice(&temp_buf[..n]);
+
+        while let Some(req) = parse_http(buf) {
+            let body_bytes = &buf[req.body_offset..req.body_offset + req.body_len];
+            
+            if req.path == "/fraud-score" && req.method == "POST" {
+                let start_time = Instant::now();
+                
+                let json_start = Instant::now();
+                let payload: RequestPayload = match serde_json::from_slice(body_bytes) {
+                    Ok(p) => p,
+                    Err(_) => {
+                        let headers = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n",
+                            RESPONSES[0].len(),
+                            if req.keep_alive { "keep-alive" } else { "close" }
+                        );
+                        stream.write_all(headers.as_bytes())?;
+                        stream.write_all(RESPONSES[0])?;
+                        stream.flush()?;
+                        
+                        let consumed = req.body_offset + req.body_len;
+                        buf.drain(0..consumed);
+                        if !req.keep_alive { return Ok(()); }
+                        continue;
+                    }
+                };
+                let json_dur = json_start.elapsed().as_nanos() as u64;
+                METRIC_JSON_PARSE_NS.fetch_add(json_dur, Ordering::Relaxed);
+
+                let vec_start = Instant::now();
+                let (req_epoch, hour, dow) = parse_datetime(payload.transaction.requested_at);
+
+                let mut q = [0.0f32; 16];
+                q[0] = clamp01((payload.transaction.amount / MAX_AMOUNT) as f32);
+                q[1] = clamp01((payload.transaction.installments / MAX_INSTALLMENTS) as f32);
+
+                let avg = payload.customer.avg_amount;
+                q[2] = if avg > 0.0 {
+                    clamp01(((payload.transaction.amount / avg) / AMOUNT_VS_AVG_RATIO) as f32)
+                } else {
+                    1.0
+                };
+                q[3] = hour as f32 / 23.0;
+                q[4] = dow as f32 / 6.0;
+
+                match &payload.last_transaction {
+                    Some(lt) => {
+                        let last_epoch = parse_datetime(lt.timestamp).0;
+                        let minutes = (req_epoch - last_epoch) as f64 / 60.0;
+                        q[5] = clamp01((minutes / MAX_MINUTES) as f32);
+                        q[6] = clamp01((lt.km_from_current / MAX_KM) as f32);
+                    }
+                    None => {
+                        q[5] = -1.0;
+                        q[6] = -1.0;
+                    }
+                }
+
+                q[7] = clamp01((payload.terminal.km_from_home / MAX_KM) as f32);
+                q[8] = clamp01((payload.customer.tx_count_24h / MAX_TX_COUNT_24H) as f32);
+                q[9] = if payload.terminal.is_online { 1.0 } else { 0.0 };
+                q[10] = if payload.terminal.card_present { 1.0 } else { 0.0 };
+
+                let is_known = payload
+                    .customer
+                    .known_merchants
+                    .iter()
+                    .any(|m| *m == payload.merchant.id);
+                q[11] = if is_known { 0.0 } else { 1.0 };
+
+                let mcc_idx = parse_mcc(payload.merchant.mcc);
+                q[12] = if mcc_idx < 10000 {
+                    state.mcc_risk_table[mcc_idx]
+                } else {
+                    0.5
+                };
+
+                q[13] = clamp01((payload.merchant.avg_amount / MAX_MERCHANT_AVG_AMOUNT) as f32);
+                q[14] = 0.0;
+                q[15] = 0.0;
+                let vec_dur = vec_start.elapsed().as_nanos() as u64;
+                METRIC_VECTORIZE_NS.fetch_add(vec_dur, Ordering::Relaxed);
+
+                let centroid_start = Instant::now();
+                let nprobe = state.nprobe;
+
+                let mut dists = [0.0f32; K_CENTROIDS];
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    use std::arch::x86_64::*;
+                    let vq0 = _mm256_loadu_ps(q.as_ptr());
+                    let vq1 = _mm256_loadu_ps(q.as_ptr().add(8));
+                    for k in 0..K_CENTROIDS {
+                        dists[k] = squared_distance_preloaded(vq0, vq1, &state.index.centroids[k]);
+                    }
+                }
+                #[cfg(target_arch = "aarch64")]
+                unsafe {
+                    use std::arch::aarch64::*;
+                    let vq0 = vld1q_f32(q.as_ptr());
+                    let vq1 = vld1q_f32(q.as_ptr().add(4));
+                    let vq2 = vld1q_f32(q.as_ptr().add(8));
+                    let vq3 = vld1q_f32(q.as_ptr().add(12));
+                    for k in 0..K_CENTROIDS {
+                        dists[k] = squared_distance_preloaded(vq0, vq1, vq2, vq3, &state.index.centroids[k]);
+                    }
+                }
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                for k in 0..K_CENTROIDS {
+                    dists[k] = squared_distance_fallback(&q, &state.index.centroids[k]);
+                }
+
+                let mut indices = [0u16; K_CENTROIDS];
+                for i in 0..K_CENTROIDS {
+                    indices[i] = i as u16;
+                }
+                indices.select_nth_unstable_by(nprobe - 1, |&a, &b| {
+                    dists[a as usize].partial_cmp(&dists[b as usize]).unwrap()
+                });
+
+                let centroid_dur = centroid_start.elapsed().as_nanos() as u64;
+                METRIC_CENTROID_SEARCH_NS.fetch_add(centroid_dur, Ordering::Relaxed);
+
+                let scan_start = Instant::now();
+                let mut top5 = [(f32::MAX, 0u8); 5];
+                let mut threshold_top5 = f32::MAX;
+
+                #[cfg(target_arch = "x86_64")]
+                let vq0 = unsafe {
+                    use std::arch::x86_64::*;
+                    _mm256_loadu_ps(q.as_ptr())
+                };
+                #[cfg(target_arch = "x86_64")]
+                let vq1 = unsafe {
+                    use std::arch::x86_64::*;
+                    _mm256_loadu_ps(q.as_ptr().add(8))
+                };
+
+                #[cfg(target_arch = "aarch64")]
+                let (vq0, vq1, vq2, vq3) = unsafe {
+                    use std::arch::aarch64::*;
+                    (
+                        vld1q_f32(q.as_ptr()),
+                        vld1q_f32(q.as_ptr().add(4)),
+                        vld1q_f32(q.as_ptr().add(8)),
+                        vld1q_f32(q.as_ptr().add(12)),
+                    )
+                };
+
+                let probed = &mut indices[0..nprobe];
+                probed.sort_unstable_by(|&a, &b| {
+                    dists[a as usize].partial_cmp(&dists[b as usize]).unwrap()
+                });
+
+                for &k_idx in probed.iter() {
+                    let k = k_idx as usize;
+                    let dist_q_c_sq = dists[k];
+                    let dist_q_c = dist_q_c_sq.sqrt();
+                    let meta = &state.index.cluster_metadata[k];
+
+                    let threshold_top5_f32 = threshold_top5.sqrt();
+
+                    if dist_q_c - meta.radius >= threshold_top5_f32 + 0.0002 {
+                        continue;
+                    }
+
+                    let start = meta.offset as usize;
+                    let end = start + meta.count as usize;
+
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        for idx in start..end {
+                            let dist_v_c = state.index.distances[idx];
+                            if (dist_v_c - dist_q_c).abs() >= threshold_top5_f32 + 0.0002 {
+                                continue;
+                            }
+                            let dist_sq = squared_distance_preloaded(vq0, vq1, &state.index.vectors[idx]);
+                            if dist_sq < threshold_top5 {
+                                top5[4] = (dist_sq, state.index.labels[idx]);
+                                let mut x = 4;
+                                while x > 0 && top5[x].0 < top5[x - 1].0 {
+                                    top5.swap(x, x - 1);
+                                    x -= 1;
+                                }
+                                threshold_top5 = top5[4].0;
+                            }
+                        }
+                    }
+
+                    #[cfg(target_arch = "aarch64")]
+                    unsafe {
+                        for idx in start..end {
+                            let dist_v_c = state.index.distances[idx];
+                            if (dist_v_c - dist_q_c).abs() >= threshold_top5_f32 + 0.0002 {
+                                continue;
+                            }
+                            let dist_sq = squared_distance_preloaded(vq0, vq1, vq2, vq3, &state.index.vectors[idx]);
+                            if dist_sq < threshold_top5 {
+                                top5[4] = (dist_sq, state.index.labels[idx]);
+                                let mut x = 4;
+                                while x > 0 && top5[x].0 < top5[x - 1].0 {
+                                    top5.swap(x, x - 1);
+                                    x -= 1;
+                                }
+                                threshold_top5 = top5[4].0;
+                            }
+                        }
+                    }
+
+                    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                    for idx in start..end {
+                        let dist_v_c = state.index.distances[idx];
+                        if (dist_v_c - dist_q_c).abs() >= threshold_top5_f32 + 0.0002 {
+                            continue;
+                        }
+                        let dist_sq = squared_distance_fallback(&q, &state.index.vectors[idx]);
+                        if dist_sq < threshold_top5 {
+                            top5[4] = (dist_sq, state.index.labels[idx]);
+                            let mut x = 4;
+                            while x > 0 && top5[x].0 < top5[x - 1].0 {
+                                top5.swap(x, x - 1);
+                                x -= 1;
+                            }
+                            threshold_top5 = top5[4].0;
+                        }
+                    }
+                }
+
+                let scan_dur = scan_start.elapsed().as_nanos() as u64;
+                METRIC_CLUSTER_SCAN_NS.fetch_add(scan_dur, Ordering::Relaxed);
+
+                let total_dur = start_time.elapsed().as_nanos() as u64;
+                METRIC_TOTAL_NS.fetch_add(total_dur, Ordering::Relaxed);
+
+                let count = METRIC_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                if count % 10000 == 0 {
+                    let count_f = count as f64;
+                    let jp = (METRIC_JSON_PARSE_NS.load(Ordering::Relaxed) as f64 / count_f) / 1000.0;
+                    let vc = (METRIC_VECTORIZE_NS.load(Ordering::Relaxed) as f64 / count_f) / 1000.0;
+                    let cs = (METRIC_CENTROID_SEARCH_NS.load(Ordering::Relaxed) as f64 / count_f) / 1000.0;
+                    let cl = (METRIC_CLUSTER_SCAN_NS.load(Ordering::Relaxed) as f64 / count_f) / 1000.0;
+                    let tot = (METRIC_TOTAL_NS.load(Ordering::Relaxed) as f64 / count_f) / 1000.0;
+                    println!(
+                        "[TELEMETRY] Req Count: {}, Avg (us): JSON={:.2}, Vec={:.2}, Centroid={:.2}, Cluster={:.2}, Total={:.2}",
+                        count, jp, vc, cs, cl, tot
+                    );
+                }
+
+                let fraud_count = top5.iter().filter(|&&(_, label)| label == 1).count();
+                let response_body = RESPONSES[fraud_count.min(5)];
+
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n",
+                    response_body.len(),
+                    if req.keep_alive { "keep-alive" } else { "close" }
+                );
+                stream.write_all(headers.as_bytes())?;
+                stream.write_all(response_body)?;
+                stream.flush()?;
+            } else if req.path == "/ready" && req.method == "GET" {
+                let (status, body) = if IS_READY.load(Ordering::Acquire) {
+                    ("HTTP/1.1 200 OK", b"OK" as &[u8])
+                } else {
+                    ("HTTP/1.1 503 Service Unavailable", b"Service Unavailable" as &[u8])
+                };
+                let headers = format!(
+                    "{}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n",
+                    status,
+                    body.len(),
+                    if req.keep_alive { "keep-alive" } else { "close" }
+                );
+                stream.write_all(headers.as_bytes())?;
+                stream.write_all(body)?;
+                stream.flush()?;
+            } else if req.path == "/telemetry" && req.method == "GET" {
+                let count = METRIC_COUNT.load(Ordering::Relaxed);
+                let json_res = if count == 0 {
+                    "{\"count\":0,\"json_parse_us\":0.0,\"vectorize_us\":0.0,\"centroid_search_us\":0.0,\"cluster_scan_us\":0.0,\"total_us\":0.0}".to_string()
+                } else {
+                    let count_f = count as f64;
+                    let jp = (METRIC_JSON_PARSE_NS.load(Ordering::Relaxed) as f64 / count_f) / 1000.0;
+                    let vc = (METRIC_VECTORIZE_NS.load(Ordering::Relaxed) as f64 / count_f) / 1000.0;
+                    let cs = (METRIC_CENTROID_SEARCH_NS.load(Ordering::Relaxed) as f64 / count_f) / 1000.0;
+                    let cl = (METRIC_CLUSTER_SCAN_NS.load(Ordering::Relaxed) as f64 / count_f) / 1000.0;
+                    let tot = (METRIC_TOTAL_NS.load(Ordering::Relaxed) as f64 / count_f) / 1000.0;
+                    format!(
+                        "{{\"count\":{},\"json_parse_us\":{:.2},\"vectorize_us\":{:.2},\"centroid_search_us\":{:.2},\"cluster_scan_us\":{:.2},\"total_us\":{:.2}}}",
+                        count, jp, vc, cs, cl, tot
+                    )
+                };
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n",
+                    json_res.len(),
+                    if req.keep_alive { "keep-alive" } else { "close" }
+                );
+                stream.write_all(headers.as_bytes())?;
+                stream.write_all(json_res.as_bytes())?;
+                stream.flush()?;
+            } else {
+                let body = b"Not Found" as &[u8];
+                let headers = format!(
+                    "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n",
+                    body.len(),
+                    if req.keep_alive { "keep-alive" } else { "close" }
+                );
+                stream.write_all(headers.as_bytes())?;
+                stream.write_all(body)?;
+                stream.flush()?;
+            }
+
+            let consumed = req.body_offset + req.body_len;
+            buf.drain(0..consumed);
+
+            if !req.keep_alive {
+                return Ok(());
+            }
+        }
+    }
+}
+
+fn run_warmup(state: &Arc<AppState>) {
+    let start = Instant::now();
+    for i in 0..500 {
+        let mut q = [0.0f32; 16];
+        for j in 0..14 {
+            q[j] = ((i * j) % 100) as f32 / 100.0;
+        }
+
+        let mut dists = [0.0f32; K_CENTROIDS];
         #[cfg(target_arch = "x86_64")]
         unsafe {
             use std::arch::x86_64::*;
-            let vq = _mm256_loadu_si256(q_i16.as_ptr() as *const __m256i);
-            for idx in start..end {
-                let dist = squared_distance_i16_preloaded(vq, &state.index.vectors[idx]);
-                if dist < threshold_candidates {
-                    top_candidates[15] = (dist, idx);
-                    let mut i = 15;
-                    while i > 0 && top_candidates[i].0 < top_candidates[i - 1].0 {
-                        top_candidates.swap(i, i - 1);
-                        i -= 1;
-                    }
-                    threshold_candidates = top_candidates[15].0;
-                }
+            let vq0 = _mm256_loadu_ps(q.as_ptr());
+            let vq1 = _mm256_loadu_ps(q.as_ptr().add(8));
+            for k in 0..K_CENTROIDS {
+                dists[k] = squared_distance_preloaded(vq0, vq1, &state.index.centroids[k]);
             }
         }
-
         #[cfg(target_arch = "aarch64")]
         unsafe {
             use std::arch::aarch64::*;
-            let vq0 = vld1q_s16(q_i16.as_ptr());
-            let vq1 = vld1q_s16(q_i16.as_ptr().add(8));
-            for idx in start..end {
-                let dist = squared_distance_i16_preloaded(vq0, vq1, &state.index.vectors[idx]);
-                if dist < threshold_candidates {
-                    top_candidates[15] = (dist, idx);
-                    let mut i = 15;
-                    while i > 0 && top_candidates[i].0 < top_candidates[i - 1].0 {
-                        top_candidates.swap(i, i - 1);
-                        i -= 1;
-                    }
-                    threshold_candidates = top_candidates[15].0;
-                }
+            let vq0 = vld1q_f32(q.as_ptr());
+            let vq1 = vld1q_f32(q.as_ptr().add(4));
+            let vq2 = vld1q_f32(q.as_ptr().add(8));
+            let vq3 = vld1q_f32(q.as_ptr().add(12));
+            for k in 0..K_CENTROIDS {
+                dists[k] = squared_distance_preloaded(vq0, vq1, vq2, vq3, &state.index.centroids[k]);
             }
         }
-
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        for idx in start..end {
-            let dist = squared_distance_i16_fallback(&q_i16, &state.index.vectors[idx]);
-            if dist < threshold_candidates {
-                top_candidates[15] = (dist, idx);
-                let mut i = 15;
-                while i > 0 && top_candidates[i].0 < top_candidates[i - 1].0 {
-                    top_candidates.swap(i, i - 1);
-                    i -= 1;
+        for k in 0..K_CENTROIDS {
+            dists[k] = squared_distance_fallback(&q, &state.index.centroids[k]);
+        }
+
+        let mut indices = [0u16; K_CENTROIDS];
+        for x in 0..K_CENTROIDS {
+            indices[x] = x as u16;
+        }
+        indices.select_nth_unstable_by(state.nprobe - 1, |&a, &b| {
+            dists[a as usize].partial_cmp(&dists[b as usize]).unwrap()
+        });
+
+        let mut top5 = [(f32::MAX, 0u8); 5];
+        let mut threshold_top5 = f32::MAX;
+
+        #[cfg(target_arch = "x86_64")]
+        let vq0 = unsafe {
+            use std::arch::x86_64::*;
+            _mm256_loadu_ps(q.as_ptr())
+        };
+        #[cfg(target_arch = "x86_64")]
+        let vq1 = unsafe {
+            use std::arch::x86_64::*;
+            _mm256_loadu_ps(q.as_ptr().add(8))
+        };
+
+        #[cfg(target_arch = "aarch64")]
+        let (vq0, vq1, vq2, vq3) = unsafe {
+            use std::arch::aarch64::*;
+            (
+                vld1q_f32(q.as_ptr()),
+                vld1q_f32(q.as_ptr().add(4)),
+                vld1q_f32(q.as_ptr().add(8)),
+                vld1q_f32(q.as_ptr().add(12)),
+            )
+        };
+
+        let probed = &mut indices[0..state.nprobe];
+        probed.sort_unstable_by(|&a, &b| {
+            dists[a as usize].partial_cmp(&dists[b as usize]).unwrap()
+        });
+
+        for &k_idx in probed.iter() {
+            let k = k_idx as usize;
+            let dist_q_c_sq = dists[k];
+            let dist_q_c = dist_q_c_sq.sqrt();
+            let meta = &state.index.cluster_metadata[k];
+
+            let threshold_top5_f32 = threshold_top5.sqrt();
+
+            if dist_q_c - meta.radius >= threshold_top5_f32 + 0.0002 {
+                continue;
+            }
+
+            let start = meta.offset as usize;
+            let end = start + meta.count as usize;
+
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                for idx in start..end {
+                    let dist_v_c = state.index.distances[idx];
+                    if (dist_v_c - dist_q_c).abs() >= threshold_top5_f32 + 0.0002 {
+                        continue;
+                    }
+                    let dist_sq = squared_distance_preloaded(vq0, vq1, &state.index.vectors[idx]);
+                    if dist_sq < threshold_top5 {
+                        top5[4] = (dist_sq, state.index.labels[idx]);
+                        let mut x = 4;
+                        while x > 0 && top5[x].0 < top5[x - 1].0 {
+                            top5.swap(x, x - 1);
+                            x -= 1;
+                        }
+                        threshold_top5 = top5[4].0;
+                    }
                 }
-                threshold_candidates = top_candidates[15].0;
+            }
+
+            #[cfg(target_arch = "aarch64")]
+            unsafe {
+                for idx in start..end {
+                    let dist_v_c = state.index.distances[idx];
+                    if (dist_v_c - dist_q_c).abs() >= threshold_top5_f32 + 0.0002 {
+                        continue;
+                    }
+                    let dist_sq = squared_distance_preloaded(vq0, vq1, vq2, vq3, &state.index.vectors[idx]);
+                    if dist_sq < threshold_top5 {
+                        top5[4] = (dist_sq, state.index.labels[idx]);
+                        let mut x = 4;
+                        while x > 0 && top5[x].0 < top5[x - 1].0 {
+                            top5.swap(x, x - 1);
+                            x -= 1;
+                        }
+                        threshold_top5 = top5[4].0;
+                    }
+                }
+            }
+
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+            for idx in start..end {
+                let dist_v_c = state.index.distances[idx];
+                if (dist_v_c - dist_q_c).abs() >= threshold_top5_f32 + 0.0002 {
+                    continue;
+                }
+                let dist_sq = squared_distance_fallback(&q, &state.index.vectors[idx]);
+                if dist_sq < threshold_top5 {
+                    top5[4] = (dist_sq, state.index.labels[idx]);
+                    let mut x = 4;
+                    while x > 0 && top5[x].0 < top5[x - 1].0 {
+                        top5.swap(x, x - 1);
+                        x -= 1;
+                    }
+                    threshold_top5 = top5[4].0;
+                }
             }
         }
     }
-
-    // 5. Re-rank os candidatos com distância f32 exata para eliminar erro de quantização
-    let mut exact_top5 = [(f32::MAX, 0u8); 5];
-    let mut threshold_exact = f32::MAX;
-    
-    let num_candidates = top_candidates.iter().filter(|&&(d, _)| d < i32::MAX).count();
-    for i in 0..num_candidates {
-        let idx = top_candidates[i].1;
-        let dist_f32 = squared_distance_fallback(&q, &state.index.f32_vectors[idx]);
-        if dist_f32 < threshold_exact {
-            let label = state.index.labels[idx];
-            exact_top5[4] = (dist_f32, label);
-            let mut j = 4;
-            while j > 0 && exact_top5[j].0 < exact_top5[j - 1].0 {
-                exact_top5.swap(j, j - 1);
-                j -= 1;
-            }
-            threshold_exact = exact_top5[4].0;
-        }
-    }
-
-    let scan_dur = scan_start.elapsed().as_nanos() as u64;
-    METRIC_CLUSTER_SCAN_NS.fetch_add(scan_dur, Ordering::Relaxed);
-
-    let total_dur = start_time.elapsed().as_nanos() as u64;
-    METRIC_TOTAL_NS.fetch_add(total_dur, Ordering::Relaxed);
-
-    let count = METRIC_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-    if count % 10000 == 0 {
-        let count_f = count as f64;
-        let jp = (METRIC_JSON_PARSE_NS.load(Ordering::Relaxed) as f64 / count_f) / 1000.0;
-        let vc = (METRIC_VECTORIZE_NS.load(Ordering::Relaxed) as f64 / count_f) / 1000.0;
-        let cs = (METRIC_CENTROID_SEARCH_NS.load(Ordering::Relaxed) as f64 / count_f) / 1000.0;
-        let cl = (METRIC_CLUSTER_SCAN_NS.load(Ordering::Relaxed) as f64 / count_f) / 1000.0;
-        let tot = (METRIC_TOTAL_NS.load(Ordering::Relaxed) as f64 / count_f) / 1000.0;
-        println!(
-            "[TELEMETRY] Req Count: {}, Avg (us): JSON={:.2}, Vec={:.2}, Centroid={:.2}, Cluster={:.2}, Total={:.2}",
-            count, jp, vc, cs, cl, tot
-        );
-    }
-
-    // Calcular o score de fraude a partir do re-ranking de f32 exato
-    let fraud_count = exact_top5.iter().filter(|&&(_, label)| label == 1).count();
-    (
-        [(header::CONTENT_TYPE, "application/json")],
-        RESPONSES[fraud_count.min(5)],
-    )
+    println!("Warmup completed in {:?}", start.elapsed());
 }
 
 fn main() {
@@ -673,7 +943,7 @@ fn main() {
     let nprobe: usize = std::env::var("NPROBE")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(48)
+        .unwrap_or(512)
         .clamp(1, MAX_NPROBE);
 
     // 1. Inicializar tabela estática de MCC de risco
@@ -702,81 +972,88 @@ fn main() {
         nprobe,
     });
 
-    // 3. Configurar rotas Axum
-    let app = Router::new()
-        .route("/ready", get(handle_ready))
-        .route("/telemetry", get(handle_telemetry))
-        .route("/fraud-score", post(handle_fraud_score))
-        .with_state(state);
+    println!("Running synthetic warmup (500 queries)...");
+    run_warmup(&state);
+    IS_READY.store(true, Ordering::Release);
+    println!("Warmup complete, ready to serve requests");
 
-    let rt = if workers <= 1 {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-    } else {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(workers)
-            .enable_all()
-            .build()
-            .unwrap()
-    };
+    // Determinar quantidade de threads para o pool síncrono.
+    // Usamos 8 threads por padrão se WORKERS for menor que 8 para garantir alta taxa de aceitação sob keep-alive.
+    let num_threads = std::cmp::max(workers * 4, 8);
+    println!("Starting synchronous network thread pool with {} threads", num_threads);
 
-    rt.block_on(async move {
-        // 4. Iniciar servidor (Socket Unix se SOCKET_PATH estiver definido, senão fallback TCP)
-        if let Ok(socket_path) = std::env::var("SOCKET_PATH") {
-            if std::path::Path::new(&socket_path).exists() {
-                let _ = std::fs::remove_file(&socket_path);
-            }
-            let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
-
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&socket_path).unwrap().permissions();
-            perms.set_mode(0o777);
-            std::fs::set_permissions(&socket_path, perms).unwrap();
-
-            println!("API escutando no socket unix: {}", socket_path);
-
-            use hyper_util::server::conn::auto;
-            use hyper_util::rt::TokioExecutor;
-            use tower::Service;
-
-            loop {
-                let (stream, _) = match listener.accept().await {
-                    Ok(conn) => conn,
-                    Err(err) => {
-                        eprintln!("Erro ao aceitar conexão: {:?}", err);
-                        continue;
-                    }
-                };
-
-                let app = app.clone();
-                tokio::spawn(async move {
-                    let stream = hyper_util::rt::TokioIo::new(stream);
-                    let hyper_service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
-                        let mut app = app.clone();
-                        async move {
-                            let req = req.map(axum::body::Body::new);
-                            app.call(req).await
-                        }
-                    });
-
-                    if let Err(_err) = auto::Builder::new(TokioExecutor::new())
-                        .serve_connection(stream, hyper_service)
-                        .await
-                    {}
-                });
-            }
-        } else {
-            let port = std::env::var("PORT")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(8080);
-            let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
-                .await
-                .unwrap();
-            println!("API escutando em http://0.0.0.0:{}", port);
-            axum::serve(listener, app).await.unwrap();
+    if let Ok(socket_path) = std::env::var("SOCKET_PATH") {
+        use std::os::unix::net::UnixListener;
+        if std::path::Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
         }
-    });
+        let listener = UnixListener::bind(&socket_path).expect("Failed to bind Unix socket");
+
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&socket_path).unwrap().permissions();
+        perms.set_mode(0o777);
+        std::fs::set_permissions(&socket_path, perms).unwrap();
+
+        println!("API escutando no socket unix: {}", socket_path);
+
+        let listener = Arc::new(listener);
+        let mut threads = Vec::new();
+        for _ in 0..num_threads {
+            let listener = listener.clone();
+            let state = state.clone();
+            let handle = std::thread::spawn(move || {
+                let mut buf = Vec::with_capacity(16384);
+                loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                            let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
+                            if let Err(_e) = handle_connection(stream, &state, &mut buf) {
+                                // Erros normais de timeout ou fechamento são ignorados silenciosamente
+                            }
+                        }
+                        Err(_e) => {}
+                    }
+                }
+            });
+            threads.push(handle);
+        }
+        for handle in threads {
+            let _ = handle.join();
+        }
+    } else {
+        let port = std::env::var("PORT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8080);
+        let listener = std::net::TcpListener::bind(format!("0.0.0.0:{}", port)).expect("Failed to bind TCP port");
+        println!("API escutando em http://0.0.0.0:{}", port);
+
+        let listener = Arc::new(listener);
+        let mut threads = Vec::new();
+        for _ in 0..num_threads {
+            let listener = listener.clone();
+            let state = state.clone();
+            let handle = std::thread::spawn(move || {
+                let mut buf = Vec::with_capacity(16384);
+                loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                            let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
+                            let _ = stream.set_nodelay(true);
+                            if let Err(_e) = handle_connection(stream, &state, &mut buf) {
+                                // Silencioso
+                            }
+                        }
+                        Err(_e) => {}
+                    }
+                }
+            });
+            threads.push(handle);
+        }
+        for handle in threads {
+            let _ = handle.join();
+        }
+    }
 }

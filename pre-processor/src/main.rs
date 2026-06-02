@@ -28,6 +28,7 @@ struct Centroid {
 struct ClusterInfo {
     offset: u32,
     count: u32,
+    radius: f32,
 }
 
 fn squared_distance(a: &[f32; 16], b: &[f32; 16]) -> f32 {
@@ -162,7 +163,7 @@ fn main() {
 
     // 3. Atribuição de todos os 3.000.000 vetores
     println!("Atribuindo todos os vetores aos centroides...");
-    let assignments: Vec<usize> = features
+    let assignments: Vec<(usize, f32)> = features
         .par_iter()
         .map(|vec| {
             let mut min_dist = f32::MAX;
@@ -174,12 +175,12 @@ fn main() {
                     best_k = k;
                 }
             }
-            best_k
+            (best_k, min_dist)
         })
         .collect();
 
     let mut cluster_assignments = vec![Vec::new(); K];
-    for (idx, &best_k) in assignments.iter().enumerate() {
+    for (idx, &(best_k, _)) in assignments.iter().enumerate() {
         cluster_assignments[best_k].push(idx);
     }
 
@@ -187,22 +188,35 @@ fn main() {
     println!("Ordenando vetores por cluster para gravação contígua...");
     let mut ordered_features = vec![[0.0f32; 16]; n_vectors];
     let mut ordered_labels = vec![0u8; n_vectors];
-    let mut cluster_metadata = vec![ClusterInfo { offset: 0, count: 0 }; K];
+    let mut ordered_distances = vec![0.0f32; n_vectors];
+    let mut cluster_metadata = vec![ClusterInfo { offset: 0, count: 0, radius: 0.0 }; K];
 
     let mut current_offset = 0u32;
     for k in 0..K {
         let indices = &cluster_assignments[k];
         let count = indices.len() as u32;
-        cluster_metadata[k] = ClusterInfo {
-            offset: current_offset,
-            count,
-        };
+        let start = current_offset as usize;
 
         for &idx in indices {
             ordered_features[current_offset as usize] = features[idx];
             ordered_labels[current_offset as usize] = labels[idx];
+            ordered_distances[current_offset as usize] = assignments[idx].1.sqrt();
             current_offset += 1;
         }
+
+        let end = current_offset as usize;
+        let mut max_radius = 0.0f32;
+        for idx in start..end {
+            if ordered_distances[idx] > max_radius {
+                max_radius = ordered_distances[idx];
+            }
+        }
+
+        cluster_metadata[k] = ClusterInfo {
+            offset: start as u32,
+            count,
+            radius: max_radius,
+        };
     }
 
     // 5. Escrever arquivo binário index.bin
@@ -245,6 +259,15 @@ fn main() {
 
     // Labels (N * 1 byte)
     out_file.write_all(&ordered_labels).unwrap();
+
+    // Distances (N * 4 bytes)
+    let distances_bytes = unsafe {
+        std::slice::from_raw_parts(
+            ordered_distances.as_ptr() as *const u8,
+            n_vectors * std::mem::size_of::<f32>(),
+        )
+    };
+    out_file.write_all(distances_bytes).unwrap();
 
     println!("Gravação concluída com sucesso! index.bin pronto.");
 }
