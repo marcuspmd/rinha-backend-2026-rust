@@ -2,6 +2,8 @@
 
 use std::fs::File;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 use axum::{
     extract::State,
     http::{header, StatusCode},
@@ -10,6 +12,10 @@ use axum::{
     Router,
 };
 use serde::Deserialize;
+
+#[cfg(not(target_os = "macos"))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 // Precomputed responses for all 6 possible fraud counts (0..=5)
 const RESPONSES: [&[u8]; 6] = [
@@ -20,6 +26,13 @@ const RESPONSES: [&[u8]; 6] = [
     b"{\"approved\":false,\"fraud_score\":0.8}",
     b"{\"approved\":false,\"fraud_score\":1.0}",
 ];
+
+static METRIC_JSON_PARSE_NS: AtomicU64 = AtomicU64::new(0);
+static METRIC_VECTORIZE_NS: AtomicU64 = AtomicU64::new(0);
+static METRIC_CENTROID_SEARCH_NS: AtomicU64 = AtomicU64::new(0);
+static METRIC_CLUSTER_SCAN_NS: AtomicU64 = AtomicU64::new(0);
+static METRIC_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+static METRIC_COUNT: AtomicU64 = AtomicU64::new(0);
 
 // Parâmetros de Busca IVF-Flat
 const K_CENTROIDS: usize = 8192;
@@ -266,16 +279,53 @@ async fn handle_ready() -> StatusCode {
     StatusCode::OK
 }
 
+async fn handle_telemetry() -> impl IntoResponse {
+    let count = METRIC_COUNT.load(Ordering::Relaxed);
+    if count == 0 {
+        return axum::Json(serde_json::json!({
+            "count": 0,
+            "json_parse_us": 0.0,
+            "vectorize_us": 0.0,
+            "centroid_search_us": 0.0,
+            "cluster_scan_us": 0.0,
+            "total_us": 0.0,
+        }));
+    }
+
+    let count_f = count as f64;
+    let json_parse_us = (METRIC_JSON_PARSE_NS.load(Ordering::Relaxed) as f64 / count_f) / 1000.0;
+    let vectorize_us = (METRIC_VECTORIZE_NS.load(Ordering::Relaxed) as f64 / count_f) / 1000.0;
+    let centroid_search_us = (METRIC_CENTROID_SEARCH_NS.load(Ordering::Relaxed) as f64 / count_f) / 1000.0;
+    let cluster_scan_us = (METRIC_CLUSTER_SCAN_NS.load(Ordering::Relaxed) as f64 / count_f) / 1000.0;
+    let total_us = (METRIC_TOTAL_NS.load(Ordering::Relaxed) as f64 / count_f) / 1000.0;
+
+    axum::Json(serde_json::json!({
+        "count": count,
+        "json_parse_us": json_parse_us,
+        "vectorize_us": vectorize_us,
+        "centroid_search_us": centroid_search_us,
+        "cluster_scan_us": cluster_scan_us,
+        "total_us": total_us,
+    }))
+}
+
 async fn handle_fraud_score(
     State(state): State<Arc<AppState>>,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
+    let start_time = Instant::now();
+
+    // 1. Parser JSON
+    let json_start = Instant::now();
     let payload: RequestPayload = match serde_json::from_slice(&body) {
         Ok(p) => p,
         // Malformed input: return legit (FP weight 1) instead of 500 (Err weight 5)
         Err(_) => return ([(header::CONTENT_TYPE, "application/json")], RESPONSES[0]),
     };
+    let json_dur = json_start.elapsed().as_nanos() as u64;
+    METRIC_JSON_PARSE_NS.fetch_add(json_dur, Ordering::Relaxed);
 
+    let vec_start = Instant::now();
     // 1. Parser rápido de data (Hinnant's algorithm, matching reference solution)
     let (req_epoch, hour, dow) = parse_datetime(payload.transaction.requested_at);
 
@@ -330,31 +380,34 @@ async fn handle_fraud_score(
     q[13] = clamp01((payload.merchant.avg_amount / MAX_MERCHANT_AVG_AMOUNT) as f32);
     q[14] = 0.0;
     q[15] = 0.0;
+    let vec_dur = vec_start.elapsed().as_nanos() as u64;
+    METRIC_VECTORIZE_NS.fetch_add(vec_dur, Ordering::Relaxed);
 
-    // 3. Encontrar os nprobe centroides mais próximos — batch de 4 por iteração para melhor ILP.
-    // K_CENTROIDS=8192 é divisível por 4; sem resto.
+    // 3. Encontrar os nprobe centroides mais próximos.
+    // Computar todas as distâncias de forma contígua em um buffer na stack para permitir auto-vetorização.
+    let centroid_start = Instant::now();
     let nprobe = state.nprobe;
-    let mut nearest_centroids = [(f32::MAX, 0usize); MAX_NPROBE];
-    let mut threshold = f32::MAX;
-    for chunk in 0..(K_CENTROIDS / 4) {
-        let k = chunk * 4;
-        let d0 = squared_distance(&q, &state.index.centroids[k]);
-        let d1 = squared_distance(&q, &state.index.centroids[k + 1]);
-        let d2 = squared_distance(&q, &state.index.centroids[k + 2]);
-        let d3 = squared_distance(&q, &state.index.centroids[k + 3]);
-        for (dist, ki) in [(d0, k), (d1, k + 1), (d2, k + 2), (d3, k + 3)] {
-            if dist < threshold {
-                nearest_centroids[nprobe - 1] = (dist, ki);
-                let mut i = nprobe - 1;
-                while i > 0 && nearest_centroids[i].0 < nearest_centroids[i - 1].0 {
-                    nearest_centroids.swap(i, i - 1);
-                    i -= 1;
-                }
-                threshold = nearest_centroids[nprobe - 1].0;
-            }
-        }
+
+    let mut dists = [0.0f32; K_CENTROIDS];
+    for k in 0..K_CENTROIDS {
+        dists[k] = squared_distance(&q, &state.index.centroids[k]);
     }
 
+    // Inicializar índices na stack
+    let mut indices = [0u16; K_CENTROIDS];
+    for i in 0..K_CENTROIDS {
+        indices[i] = i as u16;
+    }
+
+    // Quickselect O(N) na stack para obter os nprobe centróides mais próximos (desordenados)
+    indices.select_nth_unstable_by(nprobe - 1, |&a, &b| {
+        dists[a as usize].partial_cmp(&dists[b as usize]).unwrap()
+    });
+
+    let centroid_dur = centroid_start.elapsed().as_nanos() as u64;
+    METRIC_CENTROID_SEARCH_NS.fetch_add(centroid_dur, Ordering::Relaxed);
+
+    let scan_start = Instant::now();
     // Quantiza o query para i16 para o scan dos clusters (mesma codificação do índice).
     // Evita conversão i16→f32 no loop quente — permite auto-vectorização SIMD inteira.
     let q_i16: [i16; 16] = {
@@ -368,18 +421,18 @@ async fn handle_fraud_score(
     // 4. Varrer vetores nos clusters selecionados buscando os top 5 vizinhos mais próximos.
     let mut top5 = [(i32::MAX, 0u8); 5];
     let mut threshold_top5 = i32::MAX;
-    let probed = &nearest_centroids[..nprobe];
+    let probed = &indices[0..nprobe];
 
     for i in 0..nprobe {
-        let k = probed[i].1;
+        let k = probed[i] as usize;
 
         // Prefetch o início do próximo cluster enquanto processamos o atual.
+        #[cfg(target_arch = "x86_64")]
         if i + 1 < nprobe {
-            let next_k = probed[i + 1].1;
+            let next_k = probed[i + 1] as usize;
             let next_start = state.index.cluster_metadata[next_k].offset as usize;
             unsafe {
                 let ptr = state.index.vectors.as_ptr().add(next_start) as *const i16;
-                #[cfg(target_arch = "x86_64")]
                 std::arch::x86_64::_mm_prefetch(ptr as *const i8, std::arch::x86_64::_MM_HINT_T1);
             }
         }
@@ -401,6 +454,25 @@ async fn handle_fraud_score(
                 threshold_top5 = top5[4].0;
             }
         }
+    }
+    let scan_dur = scan_start.elapsed().as_nanos() as u64;
+    METRIC_CLUSTER_SCAN_NS.fetch_add(scan_dur, Ordering::Relaxed);
+
+    let total_dur = start_time.elapsed().as_nanos() as u64;
+    METRIC_TOTAL_NS.fetch_add(total_dur, Ordering::Relaxed);
+
+    let count = METRIC_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if count % 10000 == 0 {
+        let count_f = count as f64;
+        let jp = (METRIC_JSON_PARSE_NS.load(Ordering::Relaxed) as f64 / count_f) / 1000.0;
+        let vc = (METRIC_VECTORIZE_NS.load(Ordering::Relaxed) as f64 / count_f) / 1000.0;
+        let cs = (METRIC_CENTROID_SEARCH_NS.load(Ordering::Relaxed) as f64 / count_f) / 1000.0;
+        let cl = (METRIC_CLUSTER_SCAN_NS.load(Ordering::Relaxed) as f64 / count_f) / 1000.0;
+        let tot = (METRIC_TOTAL_NS.load(Ordering::Relaxed) as f64 / count_f) / 1000.0;
+        println!(
+            "[TELEMETRY] Req Count: {}, Avg (us): JSON={:.2}, Vec={:.2}, Centroid={:.2}, Cluster={:.2}, Total={:.2}",
+            count, jp, vc, cs, cl, tot
+        );
     }
 
     // 5. Calcular o score de fraude
@@ -451,6 +523,7 @@ fn main() {
     // 3. Configurar rotas Axum
     let app = Router::new()
         .route("/ready", get(handle_ready))
+        .route("/telemetry", get(handle_telemetry))
         .route("/fraud-score", post(handle_fraud_score))
         .with_state(state);
 

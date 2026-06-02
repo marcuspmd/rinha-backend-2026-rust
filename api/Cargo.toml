@@ -13,3 +13,6 @@ atoi = "2.0"
 hyper = "1.0"
 hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio"] }
 tower = { version = "0.4", features = ["util"] }
+mimalloc = "0.1"
+
+
