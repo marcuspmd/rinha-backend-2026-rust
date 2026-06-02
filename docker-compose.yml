@@ -28,7 +28,7 @@ services:
     environment:
       - SOCKET_PATH=/run/sock/api1.sock
       - WORKERS=1
-      - NPROBE=128
+      - NPROBE=512
     deploy:
       resources:
         limits:
@@ -45,7 +45,7 @@ services:
     environment:
       - SOCKET_PATH=/run/sock/api2.sock
       - WORKERS=1
-      - NPROBE=128
+      - NPROBE=512
     deploy:
       resources:
         limits:
@@ -56,6 +56,9 @@ services:
 
 volumes:
   sock-dir:
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
 
 networks:
   rinha-net:
