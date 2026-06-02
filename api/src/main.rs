@@ -37,7 +37,7 @@ static METRIC_COUNT: AtomicU64 = AtomicU64::new(0);
 // Parâmetros de Busca IVF-Flat
 const K_CENTROIDS: usize = 8192;
 // Runtime nprobe is read from NPROBE env var; this is the stack-allocated max.
-const MAX_NPROBE: usize = 256;
+const MAX_NPROBE: usize = 8192;
 
 // Constantes de Normalização
 const MAX_AMOUNT: f64 = 10000.0;
@@ -65,6 +65,7 @@ struct IVFIndex {
     // Encoding: Sentinel/regular values scaled by 5000.0.
     vectors: Vec<[i16; 16]>,
     labels: &'static [u8],
+    f32_vectors: &'static [[f32; 16]],
 }
 
 impl IVFIndex {
@@ -138,6 +139,8 @@ impl IVFIndex {
         }
         println!("Index loaded: {} vectors quantized to i16 (checksum={})", n_vectors, checksum);
 
+        let f32_vectors = unsafe { std::mem::transmute::<&[[f32; 16]], &'static [[f32; 16]]>(f32_vectors) };
+
         Self {
             _mmap: mmap,
             k_clusters,
@@ -146,6 +149,7 @@ impl IVFIndex {
             cluster_metadata,
             vectors,
             labels,
+            f32_vectors,
         }
     }
 }
@@ -252,8 +256,63 @@ fn clamp01(x: f32) -> f32 {
     x.clamp(0.0, 1.0)
 }
 
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
-fn squared_distance(a: &[f32; 16], b: &[f32; 16]) -> f32 {
+unsafe fn squared_distance_preloaded(vq0: std::arch::x86_64::__m256, vq1: std::arch::x86_64::__m256, b: &[f32; 16]) -> f32 {
+    use std::arch::x86_64::*;
+    let vb0 = _mm256_loadu_ps(b.as_ptr());
+    let vb1 = _mm256_loadu_ps(b.as_ptr().add(8));
+
+    let diff0 = _mm256_sub_ps(vq0, vb0);
+    let diff1 = _mm256_sub_ps(vq1, vb1);
+
+    let sq0 = _mm256_mul_ps(diff0, diff0);
+    let sq1 = _mm256_mul_ps(diff1, diff1);
+
+    let sum = _mm256_add_ps(sq0, sq1);
+
+    let low128 = _mm256_castps256_ps128(sum);
+    let high128 = _mm256_extractf128_ps(sum, 1);
+    let sum128 = _mm_add_ps(low128, high128);
+
+    let shuf = _mm_movehdup_ps(sum128);
+    let sum128 = _mm_add_ps(sum128, shuf);
+    let shuf = _mm_movehl_ps(shuf, sum128);
+    let sum128 = _mm_add_ps(sum128, shuf);
+
+    _mm_cvtss_f32(sum128)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn squared_distance_preloaded(
+    vq0: std::arch::aarch64::float32x4_t,
+    vq1: std::arch::aarch64::float32x4_t,
+    vq2: std::arch::aarch64::float32x4_t,
+    vq3: std::arch::aarch64::float32x4_t,
+    b: &[f32; 16],
+) -> f32 {
+    use std::arch::aarch64::*;
+    let vb0 = vld1q_f32(b.as_ptr());
+    let vb1 = vld1q_f32(b.as_ptr().add(4));
+    let vb2 = vld1q_f32(b.as_ptr().add(8));
+    let vb3 = vld1q_f32(b.as_ptr().add(12));
+
+    let diff0 = vsubq_f32(vq0, vb0);
+    let diff1 = vsubq_f32(vq1, vb1);
+    let diff2 = vsubq_f32(vq2, vb2);
+    let diff3 = vsubq_f32(vq3, vb3);
+
+    let mut sum = vmulq_f32(diff0, diff0);
+    sum = vfmaq_f32(sum, diff1, diff1);
+    sum = vfmaq_f32(sum, diff2, diff2);
+    sum = vfmaq_f32(sum, diff3, diff3);
+
+    vaddvq_f32(sum)
+}
+
+#[inline(always)]
+fn squared_distance_fallback(a: &[f32; 16], b: &[f32; 16]) -> f32 {
     let mut sum = 0.0f32;
     for i in 0..16 {
         let diff = a[i] - b[i];
@@ -262,11 +321,52 @@ fn squared_distance(a: &[f32; 16], b: &[f32; 16]) -> f32 {
     sum
 }
 
-// Pure integer i16 distance — eliminates f32 conversion in the hot cluster-scan loop.
-// Encoding: sentinel/regular values scaled by 5000.0.
-// Relative ordering is preserved; comparison uses i32 units throughout.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
-fn squared_distance_i16(a: &[i16; 16], b: &[i16; 16]) -> i32 {
+unsafe fn squared_distance_i16_preloaded(vq: std::arch::x86_64::__m256i, b: &[i16; 16]) -> i32 {
+    use std::arch::x86_64::*;
+    let vb = _mm256_loadu_si256(b.as_ptr() as *const __m256i);
+    let diff = _mm256_sub_epi16(vq, vb);
+    let prod = _mm256_madd_epi16(diff, diff);
+    
+    let low128 = _mm256_castsi256_si128(prod);
+    let high128 = _mm256_extracti128_si256(prod, 1);
+    let sum128 = _mm_add_epi32(low128, high128);
+    
+    let shuf = _mm_shuffle_epi32(sum128, 0x4E);
+    let sum128 = _mm_add_epi32(sum128, shuf);
+    let shuf = _mm_shuffle_epi32(sum128, 0x11);
+    let sum128 = _mm_add_epi32(sum128, shuf);
+    
+    _mm_cvtsi128_si32(sum128)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn squared_distance_i16_preloaded(
+    vq0: std::arch::aarch64::int16x8_t,
+    vq1: std::arch::aarch64::int16x8_t,
+    b: &[i16; 16],
+) -> i32 {
+    use std::arch::aarch64::*;
+    let vb0 = vld1q_s16(b.as_ptr());
+    let vb1 = vld1q_s16(b.as_ptr().add(8));
+
+    let diff0 = vsubq_s16(vq0, vb0);
+    let diff1 = vsubq_s16(vq1, vb1);
+
+    let sq0 = vmull_s16(vget_low_s16(diff0), vget_low_s16(diff0));
+    let sq0 = vmlal_s16(sq0, vget_high_s16(diff0), vget_high_s16(diff0));
+
+    let sq1 = vmull_s16(vget_low_s16(diff1), vget_low_s16(diff1));
+    let sq1 = vmlal_s16(sq1, vget_high_s16(diff1), vget_high_s16(diff1));
+
+    let final_sum = vaddq_s32(sq0, sq1);
+    vaddvq_s32(final_sum)
+}
+
+#[inline(always)]
+fn squared_distance_i16_fallback(a: &[i16; 16], b: &[i16; 16]) -> i32 {
     let mut sum = 0i32;
     for i in 0..16 {
         let diff = a[i] as i32 - b[i] as i32;
@@ -389,8 +489,32 @@ async fn handle_fraud_score(
     let nprobe = state.nprobe;
 
     let mut dists = [0.0f32; K_CENTROIDS];
+    
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use std::arch::x86_64::*;
+        let vq0 = _mm256_loadu_ps(q.as_ptr());
+        let vq1 = _mm256_loadu_ps(q.as_ptr().add(8));
+        for k in 0..K_CENTROIDS {
+            dists[k] = squared_distance_preloaded(vq0, vq1, &state.index.centroids[k]);
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use std::arch::aarch64::*;
+        let vq0 = vld1q_f32(q.as_ptr());
+        let vq1 = vld1q_f32(q.as_ptr().add(4));
+        let vq2 = vld1q_f32(q.as_ptr().add(8));
+        let vq3 = vld1q_f32(q.as_ptr().add(12));
+        for k in 0..K_CENTROIDS {
+            dists[k] = squared_distance_preloaded(vq0, vq1, vq2, vq3, &state.index.centroids[k]);
+        }
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     for k in 0..K_CENTROIDS {
-        dists[k] = squared_distance(&q, &state.index.centroids[k]);
+        dists[k] = squared_distance_fallback(&q, &state.index.centroids[k]);
     }
 
     // Inicializar índices na stack
@@ -418,9 +542,9 @@ async fn handle_fraud_score(
         qi
     };
 
-    // 4. Varrer vetores nos clusters selecionados buscando os top 5 vizinhos mais próximos.
-    let mut top5 = [(i32::MAX, 0u8); 5];
-    let mut threshold_top5 = i32::MAX;
+    // 4. Varrer vetores nos clusters selecionados buscando os top 16 vizinhos mais próximos.
+    let mut top_candidates = [(i32::MAX, 0usize); 16]; // (dist_i16, idx)
+    let mut threshold_candidates = i32::MAX;
     let probed = &indices[0..nprobe];
 
     for i in 0..nprobe {
@@ -441,20 +565,78 @@ async fn handle_fraud_score(
         let start = meta.offset as usize;
         let end = start + meta.count as usize;
 
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::*;
+            let vq = _mm256_loadu_si256(q_i16.as_ptr() as *const __m256i);
+            for idx in start..end {
+                let dist = squared_distance_i16_preloaded(vq, &state.index.vectors[idx]);
+                if dist < threshold_candidates {
+                    top_candidates[15] = (dist, idx);
+                    let mut i = 15;
+                    while i > 0 && top_candidates[i].0 < top_candidates[i - 1].0 {
+                        top_candidates.swap(i, i - 1);
+                        i -= 1;
+                    }
+                    threshold_candidates = top_candidates[15].0;
+                }
+            }
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            use std::arch::aarch64::*;
+            let vq0 = vld1q_s16(q_i16.as_ptr());
+            let vq1 = vld1q_s16(q_i16.as_ptr().add(8));
+            for idx in start..end {
+                let dist = squared_distance_i16_preloaded(vq0, vq1, &state.index.vectors[idx]);
+                if dist < threshold_candidates {
+                    top_candidates[15] = (dist, idx);
+                    let mut i = 15;
+                    while i > 0 && top_candidates[i].0 < top_candidates[i - 1].0 {
+                        top_candidates.swap(i, i - 1);
+                        i -= 1;
+                    }
+                    threshold_candidates = top_candidates[15].0;
+                }
+            }
+        }
+
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         for idx in start..end {
-            let dist = squared_distance_i16(&q_i16, &state.index.vectors[idx]);
-            if dist < threshold_top5 {
-                let label = state.index.labels[idx];
-                top5[4] = (dist, label);
-                let mut i = 4;
-                while i > 0 && top5[i].0 < top5[i - 1].0 {
-                    top5.swap(i, i - 1);
+            let dist = squared_distance_i16_fallback(&q_i16, &state.index.vectors[idx]);
+            if dist < threshold_candidates {
+                top_candidates[15] = (dist, idx);
+                let mut i = 15;
+                while i > 0 && top_candidates[i].0 < top_candidates[i - 1].0 {
+                    top_candidates.swap(i, i - 1);
                     i -= 1;
                 }
-                threshold_top5 = top5[4].0;
+                threshold_candidates = top_candidates[15].0;
             }
         }
     }
+
+    // 5. Re-rank os candidatos com distância f32 exata para eliminar erro de quantização
+    let mut exact_top5 = [(f32::MAX, 0u8); 5];
+    let mut threshold_exact = f32::MAX;
+    
+    let num_candidates = top_candidates.iter().filter(|&&(d, _)| d < i32::MAX).count();
+    for i in 0..num_candidates {
+        let idx = top_candidates[i].1;
+        let dist_f32 = squared_distance_fallback(&q, &state.index.f32_vectors[idx]);
+        if dist_f32 < threshold_exact {
+            let label = state.index.labels[idx];
+            exact_top5[4] = (dist_f32, label);
+            let mut j = 4;
+            while j > 0 && exact_top5[j].0 < exact_top5[j - 1].0 {
+                exact_top5.swap(j, j - 1);
+                j -= 1;
+            }
+            threshold_exact = exact_top5[4].0;
+        }
+    }
+
     let scan_dur = scan_start.elapsed().as_nanos() as u64;
     METRIC_CLUSTER_SCAN_NS.fetch_add(scan_dur, Ordering::Relaxed);
 
@@ -475,8 +657,8 @@ async fn handle_fraud_score(
         );
     }
 
-    // 5. Calcular o score de fraude
-    let fraud_count = top5.iter().filter(|&&(_, label)| label == 1).count();
+    // Calcular o score de fraude a partir do re-ranking de f32 exato
+    let fraud_count = exact_top5.iter().filter(|&&(_, label)| label == 1).count();
     (
         [(header::CONTENT_TYPE, "application/json")],
         RESPONSES[fraud_count.min(5)],
